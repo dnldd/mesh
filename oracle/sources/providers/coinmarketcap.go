@@ -7,9 +7,9 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/decred/slog"
 	"github.com/bisoncraft/mesh/oracle/sources"
 	"github.com/bisoncraft/mesh/oracle/sources/utils"
+	"github.com/decred/slog"
 )
 
 const (
@@ -86,7 +86,7 @@ func cmcQuotaFetcher(client utils.HTTPClient, apiKey string) func(ctx context.Co
 
 		return &sources.QuotaStatus{
 			FetchesRemaining: max(result.Data.Plan.CreditLimitMonthly-result.Data.Usage.CurrentMonth.CreditsUsed, 0) / coinmarketcapCreditsPerRequest,
-			FetchesLimit: result.Data.Plan.CreditLimitMonthly / coinmarketcapCreditsPerRequest,
+			FetchesLimit:     result.Data.Plan.CreditLimitMonthly / coinmarketcapCreditsPerRequest,
 			ResetTime:        resetTime,
 		}, nil
 	}

@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/decred/slog"
 	"github.com/bisoncraft/mesh/oracle/sources"
+	"github.com/decred/slog"
 )
 
 func newTestQuotaManager(nodeID string, srcs []sources.Source) (*quotaManager, *[]*OracleSnapshot) {
@@ -498,4 +498,146 @@ func TestQuotaManagerRunHeartbeatAndExpiration(t *testing.T) {
 	if _, ok := qm.getNetworkQuotas()["stale-peer"]; ok {
 		t.Error("expected stale peer to be expired")
 	}
+}
+
+// --- quotaManager integration tests ---
+
+func TestGetActivePeersForSource(t *testing.T) {
+	src := &mockSource{
+		name:      "dcrdata",
+		weight:    1.0,
+		minPeriod: 30 * time.Second,
+	}
+
+	qm, _ := newTestQuotaManager("node-A", []sources.Source{src})
+	now := time.Now()
+
+	t.Run("includes local node", func(t *testing.T) {
+		peers := qm.getActivePeersForSource("dcrdata", now)
+		if _, ok := peers["node-A"]; !ok {
+			t.Fatal("expected local node in active peers")
+		}
+		if peers["node-A"].QuotaStatus == nil {
+			t.Error("expected quota status for local node")
+		}
+	})
+
+	t.Run("filters inactive peers by 6-minute threshold", func(t *testing.T) {
+		// Add active peer (1 minute old)
+		recentTime := now.Add(-1 * time.Minute)
+		qm.handlePeerSourceQuota("node-B", makeTimestampedQuota(500, 1000, 24*time.Hour, recentTime), "dcrdata")
+
+		// Add stale peer (10 minutes old)
+		staleTime := now.Add(-10 * time.Minute)
+		qm.handlePeerSourceQuota("node-C", makeTimestampedQuota(500, 1000, 24*time.Hour, staleTime), "dcrdata")
+
+		peers := qm.getActivePeersForSource("dcrdata", now)
+
+		if _, ok := peers["node-B"]; !ok {
+			t.Error("expected active peer node-B")
+		}
+		if _, ok := peers["node-C"]; ok {
+			t.Error("expected stale peer node-C to be filtered")
+		}
+	})
+
+	t.Run("returns only relevant source", func(t *testing.T) {
+		coingecko := &mockSource{
+			name:      "coingecko",
+			weight:    1.0,
+			minPeriod: 30 * time.Second,
+		}
+
+		qm2, _ := newTestQuotaManager("node-X", []sources.Source{coingecko})
+
+		qm2.handlePeerSourceQuota("node-Y", makeTimestampedQuota(100, 200, 24*time.Hour, now), "coingecko")
+		qm2.handlePeerSourceQuota("node-Y", makeTimestampedQuota(300, 400, 24*time.Hour, now), "dcrdata")
+
+		// Query for coingecko
+		peers := qm2.getActivePeersForSource("coingecko", now)
+
+		if len(peers) != 2 { // local + node-Y
+			t.Errorf("expected 2 peers, got %d", len(peers))
+		}
+		// Verify correct quota for coingecko
+		if peers["node-Y"].FetchesRemaining != 100 {
+			t.Errorf("expected coingecko quota 100, got %d", peers["node-Y"].FetchesRemaining)
+		}
+	})
+
+	t.Run("returns empty for nonexistent source", func(t *testing.T) {
+		peers := qm.getActivePeersForSource("nonexistent", now)
+		if len(peers) != 0 {
+			t.Errorf("expected 0 peers, got %d", len(peers))
+		}
+	})
+}
+
+func TestGetNetworkSchedule(t *testing.T) {
+	src := &mockSource{
+		name:      "dcrdata",
+		weight:    1.0,
+		minPeriod: 30 * time.Second,
+	}
+
+	qm, _ := newTestQuotaManager("node-A", []sources.Source{src})
+	now := time.Now()
+
+	t.Run("single node includes self in order", func(t *testing.T) {
+		sched := qm.getNetworkSchedule("dcrdata", 30*time.Second)
+
+		if len(sched.OrderedNodes) != 1 {
+			t.Errorf("expected 1 node, got %d", len(sched.OrderedNodes))
+		}
+		if sched.OrderedNodes[0] != "node-A" {
+			t.Errorf("expected node-A, got %s", sched.OrderedNodes[0])
+		}
+	})
+
+	t.Run("respects minimum period", func(t *testing.T) {
+		sched := qm.getNetworkSchedule("dcrdata", 30*time.Second)
+
+		if sched.MinPeriod < 30*time.Second {
+			t.Errorf("expected min period >= 30s, got %v", sched.MinPeriod)
+		}
+	})
+
+	t.Run("multi-node includes active peers", func(t *testing.T) {
+		qm.handlePeerSourceQuota("node-B", makeTimestampedQuota(500, 1000, 24*time.Hour, now), "dcrdata")
+		qm.handlePeerSourceQuota("node-C", makeTimestampedQuota(500, 1000, 24*time.Hour, now), "dcrdata")
+
+		sched := qm.getNetworkSchedule("dcrdata", 30*time.Second)
+
+		if len(sched.OrderedNodes) != 3 {
+			t.Errorf("expected 3 nodes, got %d", len(sched.OrderedNodes))
+		}
+	})
+
+	t.Run("computes network sustainable rate", func(t *testing.T) {
+		qm.handlePeerSourceQuota("node-B", makeTimestampedQuota(500, 1000, 24*time.Hour, now), "dcrdata")
+
+		sched := qm.getNetworkSchedule("dcrdata", 30*time.Second)
+
+		if sched.NetworkSustainableRate <= 0 {
+			t.Errorf("expected positive network rate, got %v", sched.NetworkSustainableRate)
+		}
+	})
+
+	t.Run("deterministic ordering across calls", func(t *testing.T) {
+		qm.handlePeerSourceQuota("node-B", makeTimestampedQuota(500, 1000, 24*time.Hour, now), "dcrdata")
+		qm.handlePeerSourceQuota("node-C", makeTimestampedQuota(500, 1000, 24*time.Hour, now), "dcrdata")
+
+		sched1 := qm.getNetworkSchedule("dcrdata", 30*time.Second)
+		sched2 := qm.getNetworkSchedule("dcrdata", 30*time.Second)
+
+		if len(sched1.OrderedNodes) != len(sched2.OrderedNodes) {
+			t.Fatal("ordering changed between calls")
+		}
+
+		for i, node := range sched1.OrderedNodes {
+			if node != sched2.OrderedNodes[i] {
+				t.Errorf("node at position %d changed: %s -> %s", i, node, sched2.OrderedNodes[i])
+			}
+		}
+	})
 }

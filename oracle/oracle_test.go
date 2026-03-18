@@ -40,12 +40,20 @@ func makeFeeRateBuckets(m map[Network]map[string]*feeRateUpdate) map[Network]*fe
 }
 
 func newTestOracle(log slog.Logger) *Oracle {
+	qm := newQuotaManager(&quotaManagerConfig{
+		log:                   log,
+		nodeID:                "test-node",
+		publishQuotaHeartbeat: func(ctx context.Context, quotas map[string]*sources.QuotaStatus) error { return nil },
+		onStateUpdate:         func(*OracleSnapshot) {},
+		sources:               []sources.Source{},
+	})
 	return &Oracle{
 		log:           log,
 		prices:        make(map[Ticker]*priceBucket),
 		feeRates:      make(map[Network]*feeRateBucket),
 		diviners:      make(map[string]*diviner),
-		fetchTracker:  newFetchTracker(),
+		fetchTracker:  newFetchTracker(log),
+		quotaManager:  qm,
 		onStateUpdate: func(*OracleSnapshot) {},
 	}
 }
@@ -338,6 +346,121 @@ func TestMergePrices(t *testing.T) {
 							t.Errorf("Unexpected ticker %s in result", ticker)
 						}
 					}
+				}
+			}
+		})
+	}
+}
+
+func TestMergePrices_SkipsNegativeAndZeroPrices(t *testing.T) {
+	now := time.Now()
+
+	tests := []struct {
+		name           string
+		existingPrices map[Ticker]map[string]*priceUpdate
+		update         *OracleUpdate
+		expectedResult map[Ticker]float64
+	}{
+		{
+			name: "negative price is skipped",
+			existingPrices: map[Ticker]map[string]*priceUpdate{
+				"BTC": {
+					"source1": {
+						ticker: "BTC",
+						price:  50000.0,
+						stamp:  now,
+						weight: 1.0,
+					},
+				},
+			},
+			update: &OracleUpdate{
+				Source: "source2",
+				Stamp:  now,
+				Prices: map[Ticker]float64{
+					"BTC": -1000.0, // Negative price - should be skipped
+				},
+			},
+			expectedResult: map[Ticker]float64{
+				"BTC": 50000.0, // Only source1's price is used
+			},
+		},
+		{
+			name: "zero price is skipped",
+			existingPrices: map[Ticker]map[string]*priceUpdate{
+				"ETH": {
+					"source1": {
+						ticker: "ETH",
+						price:  3000.0,
+						stamp:  now,
+						weight: 1.0,
+					},
+				},
+			},
+			update: &OracleUpdate{
+				Source: "source2",
+				Stamp:  now,
+				Prices: map[Ticker]float64{
+					"ETH": 0.0, // Zero price - should be skipped
+				},
+			},
+			expectedResult: map[Ticker]float64{
+				"ETH": 3000.0, // Only source1's price is used
+			},
+		},
+		{
+			name: "all prices invalid results in no update",
+			existingPrices: map[Ticker]map[string]*priceUpdate{
+				"XYZ": {
+					"source1": {
+						ticker: "XYZ",
+						price:  -100.0,
+						stamp:  now,
+						weight: 1.0,
+					},
+				},
+			},
+			update: &OracleUpdate{
+				Source: "source2",
+				Stamp:  now,
+				Prices: map[Ticker]float64{
+					"XYZ": 0.0,
+				},
+			},
+			expectedResult: nil, // No valid prices, nothing in result
+		},
+	}
+
+	backend := slog.NewBackend(os.Stdout)
+	log := backend.Logger("test")
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			oracle := newTestOracle(log)
+			oracle.prices = makePriceBuckets(tt.existingPrices)
+
+			mergeResult := oracle.Merge(tt.update, "test-sender")
+
+			if tt.expectedResult == nil {
+				if mergeResult != nil && len(mergeResult.Prices) > 0 {
+					t.Errorf("Expected no prices in result, got %v", mergeResult.Prices)
+				}
+				return
+			}
+
+			if mergeResult == nil || mergeResult.Prices == nil {
+				t.Errorf("Expected prices in result, got nil")
+				return
+			}
+
+			for ticker, expectedPrice := range tt.expectedResult {
+				actualPrice, found := mergeResult.Prices[ticker]
+				if !found {
+					t.Errorf("Expected ticker %s in result", ticker)
+					continue
+				}
+				if actualPrice != expectedPrice {
+					t.Errorf("For ticker %s, expected price %.2f, got %.2f",
+						ticker, expectedPrice, actualPrice)
 				}
 			}
 		})
@@ -1379,4 +1502,419 @@ type mockHTTPClient struct{}
 
 func (m *mockHTTPClient) Do(req *http.Request) (*http.Response, error) {
 	return nil, nil
+}
+
+// TestOracleSnapshot_Empty tests snapshot with no data.
+func TestOracleSnapshot_Empty(t *testing.T) {
+	log := slog.NewBackend(os.Stderr).Logger("test")
+	oracle := newTestOracle(log)
+	oracle.nodeID = "node1"
+
+	snapshot := oracle.OracleSnapshot()
+
+	if snapshot == nil {
+		t.Fatal("expected non-nil snapshot")
+	}
+	if snapshot.NodeID != "node1" {
+		t.Errorf("got node_id %q, want %q", snapshot.NodeID, "node1")
+	}
+	if len(snapshot.Prices) != 0 {
+		t.Errorf("got %d prices, want 0", len(snapshot.Prices))
+	}
+	if len(snapshot.FeeRates) != 0 {
+		t.Errorf("got %d fee rates, want 0", len(snapshot.FeeRates))
+	}
+	if len(snapshot.Sources) != 0 {
+		t.Errorf("got %d sources, want 0", len(snapshot.Sources))
+	}
+}
+
+// TestOracleSnapshot_WithPrices tests snapshot with populated prices.
+func TestOracleSnapshot_WithPrices(t *testing.T) {
+	log := slog.NewBackend(os.Stderr).Logger("test")
+	oracle := newTestOracle(log)
+	oracle.nodeID = "node1"
+
+	now := time.Now()
+	setSourceWeights(oracle, map[string]float64{
+		"source1": 1.0,
+		"source2": 0.5,
+	})
+
+	// Populate prices
+	oracle.prices["BTC"] = newPriceBucket()
+	oracle.prices["BTC"].mergeAndUpdateAggregate("source1", &priceUpdate{
+		ticker: "BTC",
+		price:  50000.0,
+		stamp:  now,
+		weight: 1.0,
+	})
+	oracle.prices["BTC"].mergeAndUpdateAggregate("source2", &priceUpdate{
+		ticker: "BTC",
+		price:  51000.0,
+		stamp:  now,
+		weight: 0.5,
+	})
+
+	oracle.prices["ETH"] = newPriceBucket()
+	oracle.prices["ETH"].mergeAndUpdateAggregate("source1", &priceUpdate{
+		ticker: "ETH",
+		price:  3000.0,
+		stamp:  now,
+		weight: 1.0,
+	})
+
+	snapshot := oracle.OracleSnapshot()
+
+	// Verify prices structure
+	if len(snapshot.Prices) != 2 {
+		t.Errorf("got %d prices, want 2", len(snapshot.Prices))
+	}
+
+	// Verify BTC price exists
+	btcRate, exists := snapshot.Prices["BTC"]
+	if !exists {
+		t.Fatal("BTC price not found in snapshot")
+	}
+	if btcRate == nil {
+		t.Fatal("BTC SnapshotRate is nil")
+	}
+
+	// Verify contributions for BTC
+	if len(btcRate.Contributions) != 2 {
+		t.Errorf("BTC: got %d contributions, want 2", len(btcRate.Contributions))
+	}
+	if _, hasSource1 := btcRate.Contributions["source1"]; !hasSource1 {
+		t.Error("BTC: source1 contribution missing")
+	}
+	if _, hasSource2 := btcRate.Contributions["source2"]; !hasSource2 {
+		t.Error("BTC: source2 contribution missing")
+	}
+
+	// Verify ETH price
+	ethRate, exists := snapshot.Prices["ETH"]
+	if !exists {
+		t.Fatal("ETH price not found in snapshot")
+	}
+	if len(ethRate.Contributions) != 1 {
+		t.Errorf("ETH: got %d contributions, want 1", len(ethRate.Contributions))
+	}
+}
+
+// TestOracleSnapshot_WithFeeRates tests snapshot with populated fee rates.
+func TestOracleSnapshot_WithFeeRates(t *testing.T) {
+	log := slog.NewBackend(os.Stderr).Logger("test")
+	oracle := newTestOracle(log)
+	oracle.nodeID = "node1"
+
+	now := time.Now()
+	setSourceWeights(oracle, map[string]float64{
+		"source1": 1.0,
+	})
+
+	// Populate fee rates
+	oracle.feeRates["BTC"] = newFeeRateBucket()
+	oracle.feeRates["BTC"].mergeAndUpdateAggregate("source1", &feeRateUpdate{
+		network: "BTC",
+		feeRate: big.NewInt(50),
+		stamp:   now,
+		weight:  1.0,
+	})
+
+	oracle.feeRates["ETH"] = newFeeRateBucket()
+	oracle.feeRates["ETH"].mergeAndUpdateAggregate("source1", &feeRateUpdate{
+		network: "ETH",
+		feeRate: big.NewInt(30),
+		stamp:   now,
+		weight:  1.0,
+	})
+
+	snapshot := oracle.OracleSnapshot()
+
+	// Verify fee rates structure
+	if len(snapshot.FeeRates) != 2 {
+		t.Errorf("got %d fee rates, want 2", len(snapshot.FeeRates))
+	}
+
+	// Verify BTC fee rate exists
+	btcRate, exists := snapshot.FeeRates["BTC"]
+	if !exists {
+		t.Fatal("BTC fee rate not found in snapshot")
+	}
+	if btcRate == nil {
+		t.Fatal("BTC SnapshotRate is nil")
+	}
+	if btcRate.Value != "50" {
+		t.Errorf("BTC: got value %q, want %q", btcRate.Value, "50")
+	}
+
+	// Verify ETH also included
+	ethRate, exists := snapshot.FeeRates["ETH"]
+	if !exists {
+		t.Fatal("ETH fee rate not found in snapshot")
+	}
+	if ethRate.Value != "30" {
+		t.Errorf("ETH: got value %q, want %q", ethRate.Value, "30")
+	}
+}
+
+// TestOracleSnapshot_WithMultipleSources tests snapshot with multiple sources.
+func TestOracleSnapshot_WithMultipleSources(t *testing.T) {
+	log := slog.NewBackend(os.Stderr).Logger("test")
+	oracle := newTestOracle(log)
+	oracle.nodeID = "node1"
+
+	now := time.Now()
+	setSourceWeights(oracle, map[string]float64{
+		"coingecko":   1.0,
+		"coinpaprika": 1.0,
+		"dcrdata":     1.0,
+	})
+
+	// Add prices from multiple sources
+	oracle.prices["BTC"] = newPriceBucket()
+	for _, source := range []string{"coingecko", "coinpaprika", "dcrdata"} {
+		oracle.prices["BTC"].mergeAndUpdateAggregate(source, &priceUpdate{
+			ticker: "BTC",
+			price:  50000.0,
+			stamp:  now,
+			weight: 1.0,
+		})
+	}
+
+	snapshot := oracle.OracleSnapshot()
+
+	btcRate := snapshot.Prices["BTC"]
+	if btcRate == nil {
+		t.Fatal("BTC rate is nil")
+	}
+	if len(btcRate.Contributions) != 3 {
+		t.Errorf("got %d contributions, want 3", len(btcRate.Contributions))
+	}
+
+	// Verify all sources are present
+	for _, source := range []string{"coingecko", "coinpaprika", "dcrdata"} {
+		if _, exists := btcRate.Contributions[source]; !exists {
+			t.Errorf("source %q missing from contributions", source)
+		}
+	}
+}
+
+// TestOracleSnapshot_ConcurrentAccess tests that OracleSnapshot is safe with concurrent Merge operations.
+func TestOracleSnapshot_ConcurrentAccess(t *testing.T) {
+	log := slog.NewBackend(os.Stderr).Logger("test")
+	oracle := newTestOracle(log)
+	oracle.nodeID = "node1"
+
+	now := time.Now()
+	setSourceWeights(oracle, map[string]float64{
+		"source1": 1.0,
+		"source2": 1.0,
+		"source3": 1.0,
+	})
+
+	done := make(chan bool)
+
+	// Goroutine 1: Repeatedly merge prices
+	go func() {
+		for i := 0; i < 100; i++ {
+			update := &OracleUpdate{
+				Source: "source1",
+				Stamp:  now.Add(time.Duration(i) * time.Millisecond),
+				Prices: map[Ticker]float64{
+					"BTC": 50000.0 + float64(i),
+					"ETH": 3000.0 + float64(i),
+				},
+			}
+			oracle.Merge(update, "node1")
+		}
+		done <- true
+	}()
+
+	// Goroutine 2: Repeatedly take snapshots
+	go func() {
+		for i := 0; i < 100; i++ {
+			_ = oracle.OracleSnapshot()
+		}
+		done <- true
+	}()
+
+	// Goroutine 3: Merge fee rates
+	go func() {
+		for i := 0; i < 50; i++ {
+			update := &OracleUpdate{
+				Source: "source2",
+				Stamp:  now.Add(time.Duration(i*2) * time.Millisecond),
+				FeeRates: map[Network]*big.Int{
+					"BTC": big.NewInt(int64(50 + i)),
+					"ETH": big.NewInt(int64(10 + i)),
+				},
+			}
+			oracle.Merge(update, "node1")
+		}
+		done <- true
+	}()
+
+	// Wait for all goroutines
+	<-done
+	<-done
+	<-done
+
+	// Verify final snapshot is valid
+	snapshot := oracle.OracleSnapshot()
+	if snapshot == nil {
+		t.Fatal("expected non-nil snapshot")
+	}
+	if len(snapshot.Prices) == 0 && len(snapshot.FeeRates) == 0 {
+		t.Fatal("expected some prices or fee rates in final snapshot")
+	}
+}
+
+// TestPriceContributions tests price contribution aggregation.
+func TestPriceContributions(t *testing.T) {
+	log := slog.NewBackend(os.Stderr).Logger("test")
+	oracle := newTestOracle(log)
+
+	now := time.Now()
+
+	// Add prices from different sources
+	oracle.prices["BTC"] = newPriceBucket()
+	oracle.prices["BTC"].mergeAndUpdateAggregate("source1", &priceUpdate{
+		ticker: "BTC",
+		price:  50000.0,
+		stamp:  now,
+		weight: 1.0,
+	})
+	oracle.prices["BTC"].mergeAndUpdateAggregate("source2", &priceUpdate{
+		ticker: "BTC",
+		price:  51000.0,
+		stamp:  now,
+		weight: 1.5,
+	})
+
+	contributions := oracle.priceContributions()
+
+	btcRate := contributions["BTC"]
+	if btcRate == nil {
+		t.Fatal("BTC rate is nil")
+	}
+
+	// Verify value is aggregated correctly
+	// (50000*1.0 + 51000*1.5) / 2.5 = 50400
+	if btcRate.Value == "" {
+		t.Error("BTC value is empty")
+	}
+
+	// Verify contributions include both sources
+	if len(btcRate.Contributions) != 2 {
+		t.Errorf("got %d contributions, want 2", len(btcRate.Contributions))
+	}
+
+	c1 := btcRate.Contributions["source1"]
+	if c1 == nil {
+		t.Fatal("source1 contribution is nil")
+	}
+	if c1.Value == "" {
+		t.Error("source1 contribution value is empty")
+	}
+	if c1.Weight != 1.0 {
+		t.Errorf("got weight %v, want 1.0", c1.Weight)
+	}
+}
+
+// TestFeeRateContributions tests fee rate contribution aggregation.
+func TestFeeRateContributions(t *testing.T) {
+	log := slog.NewBackend(os.Stderr).Logger("test")
+	oracle := newTestOracle(log)
+
+	now := time.Now()
+
+	// Add fee rates from different sources
+	oracle.feeRates["BTC"] = newFeeRateBucket()
+	oracle.feeRates["BTC"].mergeAndUpdateAggregate("source1", &feeRateUpdate{
+		network: "BTC",
+		feeRate: big.NewInt(50),
+		stamp:   now,
+		weight:  1.0,
+	})
+	oracle.feeRates["BTC"].mergeAndUpdateAggregate("source2", &feeRateUpdate{
+		network: "BTC",
+		feeRate: big.NewInt(60),
+		stamp:   now,
+		weight:  1.0,
+	})
+
+	contributions := oracle.feeRateContributions()
+
+	btcRate := contributions["BTC"]
+	if btcRate == nil {
+		t.Fatal("BTC rate is nil")
+	}
+
+	// Verify aggregated value
+	if btcRate.Value == "" {
+		t.Error("BTC value is empty")
+	}
+
+	// Verify contributions
+	if len(btcRate.Contributions) != 2 {
+		t.Errorf("got %d contributions, want 2", len(btcRate.Contributions))
+	}
+}
+
+// TestSourcesStatus tests source status assembly.
+func TestSourcesStatus(t *testing.T) {
+	log := slog.NewBackend(os.Stderr).Logger("test")
+	oracle := newTestOracle(log)
+	oracle.nodeID = "node1"
+
+	now := time.Now()
+	setSourceWeights(oracle, map[string]float64{
+		"source1": 1.0,
+		"source2": 1.0,
+	})
+
+	// Record some fetches
+	oracle.fetchTracker.recordFetch("source1", "node1", now)
+	oracle.fetchTracker.recordFetch("source1", "node2", now.Add(-time.Hour))
+	oracle.fetchTracker.recordFetch("source2", "node1", now.Add(-time.Minute))
+
+	// Add prices for source1
+	oracle.prices["BTC"] = newPriceBucket()
+	oracle.prices["BTC"].mergeAndUpdateAggregate("source1", &priceUpdate{
+		ticker: "BTC",
+		price:  50000.0,
+		stamp:  now,
+		weight: 1.0,
+	})
+
+	status := oracle.sourcesStatus()
+
+	if len(status) != 2 {
+		t.Errorf("got %d sources, want 2", len(status))
+	}
+
+	// Verify source1 status
+	s1 := status["source1"]
+	if s1 == nil {
+		t.Fatal("source1 status is nil")
+	}
+	if s1.LastFetch == nil {
+		t.Error("source1 LastFetch is nil")
+	}
+	if len(s1.Fetches24h) == 0 {
+		t.Error("source1 Fetches24h is empty")
+	}
+	if len(s1.LatestData) == 0 {
+		t.Error("source1 LatestData is empty")
+	}
+
+	// Verify source2 status
+	s2 := status["source2"]
+	if s2 == nil {
+		t.Fatal("source2 status is nil")
+	}
+	if s2.LastFetch == nil {
+		t.Error("source2 LastFetch is nil")
+	}
 }

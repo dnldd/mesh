@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/decred/slog"
 	"github.com/bisoncraft/mesh/oracle/sources"
+	"github.com/decred/slog"
 )
 
 // newTestPool creates a QuotaTracker whose FetchQuota always errors.
@@ -356,7 +356,7 @@ func TestTrackedSource_ConsumesCreditsOnFetch(t *testing.T) {
 		FetchRates: func(ctx context.Context) (*sources.RateInfo, error) {
 			return &sources.RateInfo{}, nil
 		},
-		Tracker:           p,
+		Tracker: p,
 	})
 
 	// Trigger initial reconciliation to seed values.
@@ -382,7 +382,7 @@ func TestTrackedSource_NoConsumeOnError(t *testing.T) {
 		FetchRates: func(ctx context.Context) (*sources.RateInfo, error) {
 			return nil, fmt.Errorf("fetch error")
 		},
-		Tracker:           p,
+		Tracker: p,
 	})
 
 	// Trigger initial reconciliation to seed values.
@@ -410,7 +410,7 @@ func TestTrackedSource_FieldAccessors(t *testing.T) {
 		FetchRates: func(ctx context.Context) (*sources.RateInfo, error) {
 			return &sources.RateInfo{}, nil
 		},
-		Tracker:           p,
+		Tracker: p,
 	})
 	if pooled.Name() != "inner-source" {
 		t.Errorf("expected Name() = inner-source, got %s", pooled.Name())
@@ -461,7 +461,7 @@ func TestTrackedSource_ConcurrentFetches(t *testing.T) {
 		FetchRates: func(ctx context.Context) (*sources.RateInfo, error) {
 			return &sources.RateInfo{}, nil
 		},
-		Tracker:           p,
+		Tracker: p,
 	})
 
 	// Trigger initial reconciliation to seed values.

@@ -3,6 +3,8 @@ package oracle
 import (
 	"sync"
 	"time"
+
+	"github.com/decred/slog"
 )
 
 const trackingPeriod = 24 * time.Hour
@@ -16,6 +18,7 @@ type fetchRecord struct {
 
 // fetchTracker tracks fetch events for the past 24 hours.
 type fetchTracker struct {
+	log     slog.Logger
 	mtx     sync.Mutex
 	records []fetchRecord
 	// To reduce memory, records store uint16 IDs rather than full strings.
@@ -31,8 +34,9 @@ type fetchTracker struct {
 }
 
 // newFetchTracker creates a new fetchTracker.
-func newFetchTracker() *fetchTracker {
+func newFetchTracker(log slog.Logger) *fetchTracker {
 	return &fetchTracker{
+		log:       log,
 		sourceIDs: make(map[string]uint16),
 		nodeIDs:   make(map[string]uint16),
 		counts:    make(map[uint16]map[uint16]int),
@@ -46,10 +50,12 @@ func (ft *fetchTracker) recordFetch(source, nodeID string, stamp time.Time) {
 	defer ft.mtx.Unlock()
 	sourceID, ok := assignID(source, ft.sourceIDs, &ft.sourceNames, &ft.nextSourceID)
 	if !ok {
+		ft.log.Warnf("fetchTracker: source ID space exhausted (max 65535), fetch tracking disabled for source: %s", source)
 		return
 	}
 	nodeIDInt, ok := assignID(nodeID, ft.nodeIDs, &ft.nodeNames, &ft.nextNodeID)
 	if !ok {
+		ft.log.Warnf("fetchTracker: node ID space exhausted (max 65535), fetch tracking disabled for node: %s", nodeID)
 		return
 	}
 	r := fetchRecord{

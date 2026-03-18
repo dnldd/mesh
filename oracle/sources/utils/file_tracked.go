@@ -192,11 +192,9 @@ func (s *FileTrackedSource) FetchRates(ctx context.Context) (*sources.RateInfo, 
 	resetTimeToSave := s.resetTime
 	s.mtx.Unlock()
 
-	go func() {
-		if err := s.saveQuotaToFile(fetchesToSave, resetTimeToSave); err != nil {
-			s.log.Warnf(err.Error())
-		}
-	}()
+	if err := s.saveQuotaToFile(fetchesToSave, resetTimeToSave); err != nil {
+		return nil, err
+	}
 
 	return rates, nil
 }

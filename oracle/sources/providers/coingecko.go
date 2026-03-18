@@ -86,10 +86,10 @@ func newCoinGeckoProSource(httpClient utils.HTTPClient, log slog.Logger, apiKey 
 		Log:               log,
 	})
 	return utils.NewTrackedSource(utils.TrackedSourceConfig{
-		Name:      coinGeckoName,
-		MinPeriod: coinGeckoMinPeriod,
+		Name:       coinGeckoName,
+		MinPeriod:  coinGeckoMinPeriod,
 		FetchRates: fetchRates,
-		Tracker:   tracker,
+		Tracker:    tracker,
 	})
 }
 

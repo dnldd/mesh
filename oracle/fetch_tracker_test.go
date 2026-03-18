@@ -1,12 +1,17 @@
 package oracle
 
 import (
+	"os"
 	"testing"
 	"time"
+
+	"github.com/decred/slog"
 )
 
 func TestFetchTracker_RecordAndCounts(t *testing.T) {
-	ft := newFetchTracker()
+	backend := slog.NewBackend(os.Stdout)
+	log := backend.Logger("test")
+	ft := newFetchTracker(log)
 	now := time.Now()
 
 	ft.recordFetch("source1", "node-a", now)
@@ -27,7 +32,9 @@ func TestFetchTracker_RecordAndCounts(t *testing.T) {
 }
 
 func TestFetchTracker_LatestPerSource(t *testing.T) {
-	ft := newFetchTracker()
+	backend := slog.NewBackend(os.Stdout)
+	log := backend.Logger("test")
+	ft := newFetchTracker(log)
 	now := time.Now()
 
 	ft.recordFetch("source1", "node-a", now.Add(-time.Hour))
@@ -45,7 +52,9 @@ func TestFetchTracker_LatestPerSource(t *testing.T) {
 }
 
 func TestFetchTracker_CountsExcludes24hOld(t *testing.T) {
-	ft := newFetchTracker()
+	backend := slog.NewBackend(os.Stdout)
+	log := backend.Logger("test")
+	ft := newFetchTracker(log)
 	now := time.Now()
 
 	ft.recordFetch("source1", "node-a", now.Add(-25*time.Hour))
@@ -58,7 +67,9 @@ func TestFetchTracker_CountsExcludes24hOld(t *testing.T) {
 }
 
 func TestFetchTracker_OutOfOrderExpiry(t *testing.T) {
-	ft := newFetchTracker()
+	backend := slog.NewBackend(os.Stdout)
+	log := backend.Logger("test")
+	ft := newFetchTracker(log)
 	now := time.Now()
 
 	// Insert a recent record followed by an expired one (out of order).
@@ -72,7 +83,9 @@ func TestFetchTracker_OutOfOrderExpiry(t *testing.T) {
 }
 
 func TestFetchTracker_Empty(t *testing.T) {
-	ft := newFetchTracker()
+	backend := slog.NewBackend(os.Stdout)
+	log := backend.Logger("test")
+	ft := newFetchTracker(log)
 
 	counts := ft.fetchCounts()
 	if len(counts) != 0 {
@@ -82,5 +95,39 @@ func TestFetchTracker_Empty(t *testing.T) {
 	latest := ft.latestPerSource()
 	if len(latest) != 0 {
 		t.Errorf("expected empty latest, got %d entries", len(latest))
+	}
+}
+
+func TestFetchTracker_IDExhaustionLogging(t *testing.T) {
+	// This test verifies that when ID space exhausts, a warning is logged.
+	// We simulate exhaustion by forcing nextSourceID and nextNodeID to their max.
+	backend := slog.NewBackend(os.Stdout)
+	log := backend.Logger("test")
+	ft := newFetchTracker(log)
+
+	// Manually exhaust the source ID space
+	ft.nextSourceID = ^uint16(0) // Max uint16 value (65535)
+
+	now := time.Now()
+	// This should log a warning about source ID space exhaustion
+	ft.recordFetch("new-source", "node-a", now)
+
+	// Verify that no fetch was recorded (since source ID assignment failed)
+	counts := ft.fetchCounts()
+	if len(counts) != 0 {
+		t.Errorf("expected no fetches recorded after source ID exhaustion, got %d sources", len(counts))
+	}
+
+	// Reset source ID space and exhaust node ID space
+	ft.nextSourceID = 0
+	ft.nextNodeID = ^uint16(0) // Max uint16 value
+
+	// This should log a warning about node ID space exhaustion
+	ft.recordFetch("source1", "new-node", now)
+
+	// Verify that no fetch was recorded (since node ID assignment failed)
+	counts = ft.fetchCounts()
+	if len(counts) != 0 {
+		t.Errorf("expected no fetches recorded after node ID exhaustion, got %d sources", len(counts))
 	}
 }

@@ -8,9 +8,9 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/decred/slog"
 	"github.com/bisoncraft/mesh/oracle/sources"
 	"github.com/bisoncraft/mesh/oracle/sources/utils"
+	"github.com/decred/slog"
 )
 
 const (
@@ -107,7 +107,7 @@ func tatumQuotaFetcher(client utils.HTTPClient, apiKey string) func(ctx context.
 
 		return &sources.QuotaStatus{
 			FetchesRemaining: max(result.Limit-result.Used, 0) / tatumCreditsPerRequest,
-			FetchesLimit: result.Limit / tatumCreditsPerRequest,
+			FetchesLimit:     result.Limit / tatumCreditsPerRequest,
 			ResetTime:        nextMonth,
 		}, nil
 	}

@@ -78,6 +78,10 @@ func aggregatePriceSources(sources map[string]*priceUpdate) float64 {
 		if weight == 0 {
 			continue
 		}
+		// Skip zero or negative prices.
+		if entry.price <= 0 {
+			continue
+		}
 		totalWeight += weight
 		weightedSum += weight * entry.price
 	}

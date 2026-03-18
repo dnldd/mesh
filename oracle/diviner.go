@@ -96,11 +96,9 @@ func (d *diviner) fetchUpdates(ctx context.Context) error {
 		}
 	}
 
-	go func() {
-		if err := d.publishUpdate(ctx, update); err != nil {
-			d.log.Errorf("Failed to publish oracle update: %v", err)
-		}
-	}()
+	if err := d.publishUpdate(ctx, update); err != nil {
+		d.log.Errorf("Failed to publish oracle update: %v", err)
+	}
 
 	return nil
 }
@@ -126,7 +124,10 @@ func (d *diviner) run(ctx context.Context) {
 			d.nextFetchInfo.Store(info)
 			d.fireScheduleChanged(info)
 		case <-timer.C:
-			if err := d.fetchUpdates(ctx); err != nil {
+			fetchCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			err := d.fetchUpdates(fetchCtx)
+			cancel()
+			if err != nil {
 				d.log.Errorf("Failed to fetch divination: %v", err)
 				// Retry after 1 minute on errors.
 				const errPeriod = time.Minute

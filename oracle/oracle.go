@@ -208,7 +208,7 @@ func New(cfg *Config) (*Oracle, error) {
 		publishUpdate: cfg.PublishUpdate,
 		onStateUpdate: cfg.OnStateUpdate,
 		quotaManager:  quotaManager,
-		fetchTracker:  newFetchTracker(),
+		fetchTracker:  newFetchTracker(cfg.Log),
 		nodeID:        cfg.NodeID,
 	}
 
